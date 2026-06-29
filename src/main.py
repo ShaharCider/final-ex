@@ -8,6 +8,8 @@ from sklearn.preprocessing import StandardScaler
 
 import pandas as pd
 
+from scipy.signal import welch
+
 import matplotlib.pyplot as plt
 
 from args_parser import parse_args
@@ -36,10 +38,13 @@ First, we will explore the data and search for informative features. Once you id
 
 General Guidelines:
 * All before each visualization, I want to have a comment describing the exact graph showing, which would contribute to the report. Mark these comments with a unique report tag, so it'll be easy to tell where they are.
+* Add a unique figure subtag before describing figures
 * Use the report tags in descriptions that would contribute to understanding of the general process/code, which will go to the report as well.
 * * keep the comments short and concise
 * * Not all comments are for the report, pick them wisely.
 * Doc string should have a blank line after \"\"\" and before the text
+* All temp files should be in the temp/ folder.
+* * The temp/ folder should be deleted at the end of the entire project
 
 Additional info:
 * Dataset: g.BSanalyze testdata "Right and Left Hand Movement Imagination" (user manual p.319, testdata/RightLeftImagination).
@@ -101,11 +106,11 @@ TEST_DATA_PATH = DATA_PATH / 'motor_imagery_test_data.npz'
 # [REPORT] Four distinct colors are used consistently across all visualizations:
 # the two EEG channels (C3, C4) are encoded by C3_COLOR / C4_COLOR, and the two
 # imagined-movement classes (LEFT, RIGHT) by LEFT_COLOR / RIGHT_COLOR. All four
-# colors (blue, red, green, yellow) are visually distinct.
+# colors (blue, red, green, orange) are visually distinct.
 C3_COLOR = 'blue'
 C4_COLOR = 'red'
 LEFT_COLOR = 'green'
-RIGHT_COLOR = 'yellow'
+RIGHT_COLOR = 'orange'
 
 # ---------------------------------------------------------------------
 N_SAMPLES = 768          # time samples per trial
@@ -129,6 +134,7 @@ N_PLOT_TRIALS = 20       # number of random trials drawn per class figure
 # Make the random trial selection reproducible for the report - choose a more interesting seed
 rng = np.random.default_rng(0)
 
+# Shared training data + derived arrays, reused across questions (Q1, Q2, ...)
 train_npz = np.load(TRAIN_DATA_PATH, allow_pickle=True)
 train_data = train_npz['data']        # (128, 768, 3)
 train_labels = train_npz['labels']    # (4, 128)
@@ -143,6 +149,7 @@ right_trial_idx = np.where(train_labels[RIGHT_ROW] == 1)[0]
 
 def plot_class_trials(class_name, class_trial_idx):
     """
+
     Draw one figure of N_PLOT_TRIALS subplots for a single class.
 
     Each subplot shows one randomly chosen trial of the class, plotting both EEG
@@ -178,20 +185,26 @@ def plot_class_trials(class_name, class_trial_idx):
     return fig
 
 
-# [REPORT] Figure 1 (LEFT class): a 4x5 grid of 20 subplots, each showing one
-# randomly selected LEFT-hand motor-imagery trial. In every subplot the C3
-# electrode is drawn in blue and the C4 electrode in red, against time in
-# seconds. This lets us eyeball qualitative within-class structure and later
-# compare it against the RIGHT class.
-plot_class_trials('LEFT', left_trial_idx)
+def run_q1():
+    """
 
-# [REPORT] Figure 2 (RIGHT class): the same 4x5 grid of 20 subplots for 20
-# randomly selected RIGHT-hand motor-imagery trials, with C3 in blue and C4 in
-# red. Comparing this figure with the LEFT figure is the qualitative inspection
-# step requested in Q1 (looking for class-dependent differences between C3/C4).
-plot_class_trials('RIGHT', right_trial_idx)
+    Render the Q1 per-class trial grids (LEFT and RIGHT) and show them.
+    """
+    # [REPORT][FIG-Q1-LEFT] Figure 1 (LEFT class): a 4x5 grid of 20 subplots, each
+    # showing one randomly selected LEFT-hand motor-imagery trial. In every subplot
+    # the C3 electrode is drawn in blue and the C4 electrode in red, against time in
+    # seconds. This lets us eyeball qualitative within-class structure and later
+    # compare it against the RIGHT class.
+    plot_class_trials('LEFT', left_trial_idx)
 
-plt.show()
+    # [REPORT][FIG-Q1-RIGHT] Figure 2 (RIGHT class): the same 4x5 grid of 20 subplots
+    # for 20 randomly selected RIGHT-hand motor-imagery trials, with C3 in blue and
+    # C4 in red. Comparing this figure with the LEFT figure is the qualitative
+    # inspection step requested in Q1 (looking for class differences between C3/C4).
+    plot_class_trials('RIGHT', right_trial_idx)
+
+    plt.show()
+
 
 """
 [REPORT]
@@ -222,7 +235,130 @@ weak feature and the discriminative info likely lives in the frequency domain
 ## ======================= 2: Spectral Analysis =======================
 ## ====================================================================
 
-info_bands = {}
+# [REPORT] Motor-imagery sub-window. The g.BSanalyze "Movement Imagination"
+# timeline is an 8 s trial: fixation at 0 s, beep ~2 s, arrow cue 3 -> 4.25 s,
+# and the subject keeps imagining the movement until 8 s. Our .npz epoch is only
+# 768 samples = 6 s at 128 Hz, i.e. a cropped sub-window of that 8 s trial. To
+# capture the imagery (and avoid the pre-cue baseline/fixation), we analyse the
+# second half of the epoch, from 3.0 s to 6.0 s. At FS = 128 Hz this is samples
+# [384, 768), a 3 s window (384 samples) -- well over the >=1 s recommended for
+# stable low-frequency (mu ~8-13 Hz) estimation.
+IMAGERY_START_S = 3.0                          # imagery window start [sec]
+IMAGERY_END_S = 6.0                            # imagery window end [sec]
+IMAGERY_START_IDX = int(IMAGERY_START_S * FS)  # -> sample 384
+IMAGERY_END_IDX = int(IMAGERY_END_S * FS)      # -> sample 768
+
+# [REPORT] Welch parameters: nperseg = 1.0 s (128 samples) gives ~1 Hz frequency
+# resolution, satisfying the ">=0.5 s, preferably >=1 s" requirement; 50% overlap
+# (Hann window) yields several segments inside the 3 s window for a smoother PSD.
+WELCH_NPERSEG = min(int(FS * 1.0), IMAGERY_END_IDX - IMAGERY_START_IDX)
+WELCH_NOVERLAP = WELCH_NPERSEG // 2
+
+# Restrict the displayed spectrum to a sensible EEG range so mu (~8-13 Hz) and
+# beta (~13-30 Hz) are visible without high-frequency clutter.
+SPECTRUM_FREQ_RANGE = (0, 40)                  # [Hz]
+
+
+def class_channel_psd(class_trial_idx, channel_idx):
+    """
+
+    Compute the trial-averaged Welch PSD for one class on one channel.
+
+    Slices every trial of the class to the motor-imagery window, runs welch once
+    (passing the stacked trials as a 2D array so welch returns a PSD per trial),
+    then averages across trials and returns the +-1 standard-error band.
+    Trial data is passed in explicitly. Returns: f, p_mean, p_sem.
+    """
+    # (n_trials, window_len): one row per trial, restricted to the imagery window
+    segments = train_data[class_trial_idx, IMAGERY_START_IDX:IMAGERY_END_IDX,
+                          channel_idx]
+    # One welch call per channel/class; axis=-1 -> a PSD per trial (per row).
+    f, psd_per_trial = welch(segments, fs=FS, nperseg=WELCH_NPERSEG,
+                             noverlap=WELCH_NOVERLAP, window='hann',
+                             scaling='density', detrend=False, axis=-1)
+    p_mean = psd_per_trial.mean(axis=0)
+    n_trials = psd_per_trial.shape[0]
+    # +-1 standard ERROR across trials (not std): std / sqrt(n).
+    p_sem = psd_per_trial.std(axis=0, ddof=1) / np.sqrt(n_trials)
+    return f, p_mean, p_sem
+
+
+def plot_psd_on_ax(ax, f, p, p_sem, color, label):
+    """
+
+    Plot a single PSD trace on `ax` (in dB) with a +-1 SE shaded band.
+
+    Adapted from ex3's plot_psd_on_ax: the shaded band is exactly +-1 standard
+    error (not a 95% CI), and the trace is shown in dB (10*log10).
+    """
+    mask = (f >= SPECTRUM_FREQ_RANGE[0]) & (f <= SPECTRUM_FREQ_RANGE[1])
+    fz, pz, semz = f[mask], p[mask], p_sem[mask]
+    p_db = 10 * np.log10(pz)
+    # Propagate the SE through the dB transform (delta method).
+    sem_db = 10 / np.log(10) * (semz / pz)
+    ax.plot(fz, p_db, color=color, label=label, lw=1.4)
+    ax.fill_between(fz, p_db - sem_db, p_db + sem_db, color=color, alpha=0.25,
+                    linewidth=0, label=f'{label} +-1 SE')
+
+
+def run_q2():
+    """
+
+    Render the Q2 power-spectrum figure (C3/C4 subplots, LEFT vs RIGHT) and show it.
+    """
+    # [REPORT][FIG-Q2-SPECTRA] Figure 3 (power spectra): one figure with two subplots,
+    # C3 (left) and C4 (right). Each subplot overlays the trial-averaged Welch power
+    # spectrum of the LEFT class (LEFT_COLOR) and the RIGHT class (RIGHT_COLOR), each
+    # with a +-1 standard-error band, computed only on the 3-6 s motor-imagery window.
+    # PSD is shown in dB over 0-40 Hz so the mu (~8-13 Hz) and beta (~13-30 Hz)
+    # bands are visible for comparing class separability.
+    fig_psd, (ax_c3, ax_c4) = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
+    fig_psd.suptitle('Power spectra (Welch, 3-6 s imagery window) by channel & class',
+                     fontsize=14, fontweight='bold')
+
+    for ax, ch_idx, ch_name in ((ax_c3, C3_IDX, 'C3'), (ax_c4, C4_IDX, 'C4')):
+        f_left, p_left, sem_left = class_channel_psd(left_trial_idx, ch_idx)
+        f_right, p_right, sem_right = class_channel_psd(right_trial_idx, ch_idx)
+        plot_psd_on_ax(ax, f_left, p_left, sem_left, LEFT_COLOR, 'LEFT')
+        plot_psd_on_ax(ax, f_right, p_right, sem_right, RIGHT_COLOR, 'RIGHT')
+        ax.set_title(ch_name)
+        ax.set_xlabel('Frequency [Hz]')
+        ax.set_xlim(SPECTRUM_FREQ_RANGE)
+        ax.grid(alpha=0.3)
+        ax.legend()
+    ax_c3.set_ylabel('PSD [dB re µV²/Hz]')
+
+    plt.tight_layout(rect=(0, 0, 1, 0.96))
+    plt.show()
+
+
+# [REPORT] Candidate frequency bands for class separation. The mu (8-13 Hz) and beta (13-30 Hz) sensorimotor rhythms
+# are the classic event-related (de)synchronization bands for motor imagery.
+info_bands = {'mu': (8, 13), 'beta': (13, 30)}
+
+"""
+[REPORT]
+Q2 - Power-spectrum comparison (grounded in the rendered figure):
+
+* The single most separating feature is a sharp RIGHT-class beta peak at
+  ~16-17 Hz that is essentially absent in the LEFT class on BOTH channels.
+  It is strongest on C4 (RIGHT rises ~6 dB above LEFT, well outside the
+  narrow +-1 SE bands -> a real, not noise-driven, difference) and clearly
+  present on C3 too (RIGHT ~1 dB vs LEFT ~-9 dB at the peak).
+* Low beta (13-30 Hz) is therefore the most useful band: averaged over the
+  band, RIGHT has markedly higher power than LEFT (C4: ~6 dB, C3: ~4 dB).
+* In the mu band (8-13 Hz) the difference is weaker and reversed: LEFT shows
+  a slightly higher mu bump than RIGHT (~1-2 dB, C3 a bit more than C4), so
+  mu is a secondary, weaker discriminator.
+* Contralateral pattern (C3<->right hand, C4<->left hand): only partially
+  visible. The beta separation appears on both channels rather than being
+  cleanly lateralised, and if anything the right-hand (RIGHT) beta increase
+  is most prominent on C4 (the left-hand area), so the textbook contralateral
+  ERD/ERS mapping is NOT clean in this data.
+* Conclusion: beta-band (~13-30 Hz, especially the ~16 Hz peak) power is the
+  promising feature for LEFT-vs-RIGHT separation, with mu as a weaker backup;
+  both are carried forward in info_bands for Q3 feature extraction.
+"""
 
 ## ====================================================================
 ## ====================== 3: Feature Extraction =======================
@@ -247,3 +383,16 @@ max_n_features = None   # TODO (Q4): set max number of features
 ## ====================================================================
 
 RESULTS_PATH = None  # TODO (Q5): Path OBJECT to the results folder
+
+
+def main():
+    """
+
+    Run every question's analysis in order.
+    """
+    run_q1()
+    run_q2()
+
+
+if __name__ == '__main__':
+    main()
