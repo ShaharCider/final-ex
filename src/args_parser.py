@@ -8,7 +8,7 @@ def parse_args():
 
     parser.add_argument('--data_dir', 
                         type=str, 
-                        default='', # TODO: set the default data directory
+                        default='data', # (script is run from final-ex/)
                         help='Directory containing the data')
     
     return parser.parse_args()
